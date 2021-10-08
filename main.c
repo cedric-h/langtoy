@@ -73,17 +73,17 @@ static void lex_print(char *src, Lex *lex) {
 static int is_numeric(char c) { return '0' <= c && c <= '9'; }
 static int is_letter(char c) { return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z'); }
 
-static uint64_t hash_strn(char *str, int len) {
-  uint64_t res = 5381;
-  for (int i = 0; i < len; i++)
-    res = ((res << 5) + res) + (uint8_t)str[i];
-  return res;
+static uint64_t hash_strn(char *p, int n_bytes) {
+  uint64_t h = 14695981039346656037ul;
+  for (int i = 0; i < n_bytes; i++)
+    h = (h * 1099511628211) ^ (uint8_t)p[i];
+  return h;
 }
 static uint64_t hash_str(char *str) {
-  uint64_t res = 5381;
+  uint64_t h = 14695981039346656037ul;
   for (; *str; str++)
-    res = ((res << 5) + res) + (uint8_t)*str;
-  return res;
+    h = (h * 1099511628211) ^ (uint8_t)*str;
+  return h;
 }
 
 static Lex *lex(char *src) {
@@ -161,6 +161,7 @@ static Lex *lex(char *src) {
     out.char_to = rdr - src;
     *wtr++ = out;
   }
+  *wtr++ = (Lex) { LexKind_EOF };
   return res;
 }
 
@@ -184,7 +185,7 @@ static void val_print(Val val) {
     case ValKind_NIL:  printf("nil");                              break;
     case ValKind_BOOL: fputs(val.bool ? "true" : "false", stdout); break;
     case ValKind_NUM:  printf("%f", val.num);                      break;
-    case ValKind_STR:  fputs(val.str, stdout);                     break;
+    case ValKind_STR:  printf("\"%s\"", val.str);                  break;
   };
 }
 
@@ -206,15 +207,38 @@ struct Expr {
   };
 };
 
+typedef enum {
+  StmtKind_NULL,
+  StmtKind_DECL,
+  StmtKind_EXPR,
+  StmtKind_BLOCK,
+  StmtKind_PRINT,
+} StmtKind;
+typedef struct Stmt Stmt;
+struct Stmt {
+  StmtKind kind;
+  Lex op;
+  uint64_t ident; /* for StmtKind_DECL */
+  union {
+    Expr *expr; /* valid for StmtKind_EXPR, StmtKind_PRINT, StmtKind_DECL */
+    Stmt *last_stmt; /* valid for StmtKind_BLOCK */
+  };
+};
+
 typedef struct {
   Lex *in;
-  Expr *out; /* last expression output; to initialize, malloc and subtract 1 */
+  Expr *expr_out; /* last expression output; to initialize, malloc and subtract 1 */
+  Stmt *stmt_out;
   char *src;
 } ParseState;
 
-static Expr *ps_push(ParseState *ps, Expr expr) {
-  *++ps->out = expr;
-  return ps->out;
+static Expr *ps_push_expr(ParseState *ps, Expr expr) {
+  *++ps->expr_out = expr;
+  return ps->expr_out;
+}
+static Stmt *ps_push_stmt(ParseState *ps, Stmt stmt) {
+  *++ps->stmt_out = stmt;
+  return ps->stmt_out;
 }
 
 static Expr *parse_expr(ParseState *ps);
@@ -231,17 +255,16 @@ static Expr *parse_primary(ParseState *ps) {
       ps->in++;
       Expr *expr = parse_expr(ps);
       if (ps->in->kind != LexKind_RIGHT_PAREN) bail("unmatched paren!?");
-      *++ps->out = (Expr) { ExprKind_GROUPING, *ps->in++, .expr = expr };
-      return ps->out;
+      return ps_push_expr(ps, (Expr) { ExprKind_GROUPING, *ps->in++, .expr = expr });
     } break;
     default: bail("Unexpected token!"); break;
   }
-  return ps_push(ps, (Expr) { ExprKind_LITERAL, *ps->in++, .val = val });
+  return ps_push_expr(ps, (Expr) { ExprKind_LITERAL, *ps->in++, .val = val });
 }
 
 static Expr *parse_unary(ParseState *ps) {
   if (ps->in->kind == LexKind_BANG || ps->in->kind == LexKind_MINUS) {
-    return ps_push(ps, (Expr) { ExprKind_UNARY, *ps->in++, .expr = parse_unary(ps) });
+    return ps_push_expr(ps, (Expr) { ExprKind_UNARY, *ps->in++, .expr = parse_unary(ps) });
   }
   return parse_primary(ps);
 }
@@ -250,7 +273,7 @@ static Expr *parse_factor(ParseState *ps) {
   Expr *expr = parse_unary(ps);
 
   while (ps->in->kind == LexKind_SLASH || ps->in->kind == LexKind_STAR)
-    expr = ps_push(ps, (Expr) { ExprKind_BINARY, *ps->in++, {{ expr, parse_unary(ps) }} });
+    expr = ps_push_expr(ps, (Expr) { ExprKind_BINARY, *ps->in++, {{ expr, parse_unary(ps) }} });
 
   return expr;
 }
@@ -259,7 +282,7 @@ static Expr *parse_term(ParseState *ps) {
   Expr *expr = parse_factor(ps);
 
   while (ps->in->kind == LexKind_PLUS || ps->in->kind == LexKind_MINUS)
-    expr = ps_push(ps, (Expr) { ExprKind_BINARY, *ps->in++, {{ expr, parse_factor(ps) }} });
+    expr = ps_push_expr(ps, (Expr) { ExprKind_BINARY, *ps->in++, {{ expr, parse_factor(ps) }} });
 
   return expr;
 }
@@ -271,7 +294,7 @@ static Expr *parse_comparison(ParseState *ps) {
          ps->in->kind == LexKind_LESS_EQUAL    ||
          ps->in->kind == LexKind_GREATER       ||
          ps->in->kind == LexKind_GREATER_EQUAL)
-    expr = ps_push(ps, (Expr) { ExprKind_BINARY, *ps->in++, {{ expr, parse_term(ps) }} });
+    expr = ps_push_expr(ps, (Expr) { ExprKind_BINARY, *ps->in++, {{ expr, parse_term(ps) }} });
 
   return expr;
 }
@@ -280,13 +303,52 @@ static Expr *parse_equality(ParseState *ps) {
   Expr *expr = parse_comparison(ps);
 
   while (ps->in->kind == LexKind_BANG_EQUAL || ps->in->kind == LexKind_EQUAL_EQUAL)
-    expr = ps_push(ps, (Expr) { ExprKind_BINARY, *ps->in++, {{ expr, parse_comparison(ps) }} });
+    expr = ps_push_expr(ps, (Expr) { ExprKind_BINARY, *ps->in++, {{ expr, parse_comparison(ps) }} });
 
   return expr;
 }
 
 static Expr *parse_expr(ParseState *ps) {
   return parse_equality(ps);
+}
+
+static Stmt *parse_stmt(ParseState *ps) {
+  Stmt *stmt = NULL;
+  switch (ps->in->kind) {
+    case LexKind_VAR: {
+      assert(ps->in[1].kind == LexKind_IDENTIFIER &&
+             ps->in[2].kind == LexKind_EQUAL      );
+      ps->in += 3;
+      stmt = ps_push_stmt(ps, (Stmt) {
+        .kind = StmtKind_DECL,
+        .ident = ps->in[1].hash,
+        .expr = parse_expr(ps)
+      });
+    } break;
+    case LexKind_LEFT_BRACE: {
+      Stmt *last = NULL;
+      Lex lbl = *ps->in++;
+      while (ps->in->kind != LexKind_RIGHT_BRACE)
+        last = parse_stmt(ps);
+      ps->in++;
+      stmt = ps_push_stmt(ps, (Stmt) { StmtKind_BLOCK, lbl, .last_stmt = last });
+    } break;
+    case LexKind_PRINT: {
+      Lex pl = *ps->in++;
+      stmt = ps_push_stmt(ps, (Stmt) { StmtKind_PRINT, pl, .expr = parse_expr(ps) });
+    } break;
+    default: {
+      Expr *e = parse_expr(ps);
+      stmt = ps_push_stmt(ps, (Stmt) { StmtKind_EXPR, *ps->in, .expr = e });
+    } break;
+  }
+  assert(ps->in++->kind == LexKind_SEMICOLON);
+  return stmt;
+}
+
+static void parse_program(ParseState *ps) {
+  while (ps->in->kind != LexKind_EOF)
+    parse_stmt(ps);
 }
 
 static void print_expr(char *src, Expr *expr) {
@@ -313,17 +375,44 @@ static void print_expr(char *src, Expr *expr) {
   }
 }
 
-typedef struct { Expr *expr, *top; } ParseRes;
-static ParseRes parse(char *str) {
-  Lex *in = lex(str), *end = in; while (end++->kind);
-  Expr *out = calloc(end - in, sizeof(Expr));
-  ParseState ps = { .in = in, .src = str, .out = out - 1 };
-  Expr *top = parse_expr(&ps);
+static void print_stmts(char *src, Stmt *stmt, Stmt *end) {
+  for (; stmt->kind && stmt != end; stmt++)
+    switch (stmt->kind) {
+      case StmtKind_NULL: bail("Unexpected null statement!");                             break;
+      case StmtKind_DECL: printf("var %ld = ", stmt->ident); print_expr(src, stmt->expr); break;
+      case StmtKind_EXPR: print_expr(src, stmt->expr);                                    break;
+      case StmtKind_PRINT: printf("print "); print_expr(src, stmt->expr);                 break;
+      case StmtKind_BLOCK: {
+        printf("{\n");
+        print_stmts(src, stmt+1, stmt->last_stmt);
+        printf("}\n");
+      } break;
+    }
+  putchar(';');
+}
 
-  print_expr(str, top);
+typedef struct { Expr *expr; Stmt *stmt; } ParseRes;
+static ParseRes parse(char *str) {
+  Lex *lex_in = lex(str), *lex_end = lex_in;
+
+  int stmt_n = 0; /* approximate number of statements lexed */
+  for (; lex_end->kind; lex_end++)
+    stmt_n += lex_end->kind == LexKind_SEMICOLON;
+
+  Expr *expr = calloc(lex_end - lex_in, sizeof(Expr));
+  Stmt *stmt = calloc(          stmt_n, sizeof(Stmt));
+  ParseState ps = {
+    .src = str,
+    .in = lex_in,
+    .expr_out = expr - 1,
+    .stmt_out = stmt - 1
+  };
+  parse_program(&ps);
+
+  print_stmts(str, stmt, NULL);
   putchar('\n');
-  free(in);
-  return (ParseRes) { .expr = out, .top = top };
+  free(lex_in);
+  return (ParseRes) { .expr = expr, .stmt = stmt };
 }
 
 static Val eval_expr(Expr *expr);
@@ -400,11 +489,20 @@ static Val eval_expr(Expr *expr) {
   return (Val) {0};
 }
 
+static void eval_stmt(Stmt *stmt) {
+  switch (stmt->kind) {
+    case StmtKind_PRINT: val_print(eval_expr(stmt->expr)); putchar('\n'); break;
+    default: bail("Unhandled StmtKind"); break;
+  }
+}
+
 static void eval(char *str) {
   ParseRes pr = parse(str);
-  val_print(eval_expr(pr.top));
-  putchar('\n');
+  Stmt *wtr = pr.stmt;
+  for (; wtr->kind; wtr++)
+    eval_stmt(wtr);
   free(pr.expr);
+  free(pr.stmt);
 }
 
 static void repl() {
