@@ -14,6 +14,8 @@ static void bailf(const char* format, ... ) {
     va_start(args, format);
     vprintf(format, args);
     va_end(args);
+
+    putchar('\n'); /* trigger stdout flush */
     assert(0);
 }
 
@@ -29,9 +31,9 @@ static void bailf(const char* format, ... ) {
   ENTRY( THIS, "this" ) ENTRY( CLASS, "class" ) ENTRY(SUPER, "super") \
 
 typedef enum {
-  // keywords
-  LexKind_NULL,
+  LexKind_NULL, /* not the same as NIL, used to detect zero-initialization */
 
+  // keywords
 #define ENTRY(variant, text) LexKind_##variant,
   KEYWORDS
 #undef ENTRY
@@ -88,8 +90,8 @@ static uint64_t hash_str(char *str) {
 
 static Lex *lex(char *src) {
   char *rdr = src;
-  /* number of lexemes will be at most 1 per char */
-  Lex *res = calloc(strlen(src), sizeof(Lex)), *wtr = res;
+  /* number of lexemes will be at most 1 per char, plus EOF */
+  Lex *res = calloc(strlen(src) + 1, sizeof(Lex)), *wtr = res;
 
   uint64_t keyword_hashes[] = {
 #define ENTRY(variant, text) [LexKind_##variant] = hash_str(text),
@@ -152,7 +154,7 @@ static Lex *lex(char *src) {
             if (out.hash == keyword_hashes[i])
               out.kind = i;
         } else {
-          bailf("Unexpected character: %c\n", *rdr);
+          bailf("Unexpected character: %c", *rdr);
           rdr++;
           continue;
         }
@@ -195,6 +197,7 @@ typedef enum {
   ExprKind_UNARY,
   ExprKind_GROUPING,
   ExprKind_LITERAL,
+  ExprKind_VARIABLE,
 } ExprKind;
 typedef struct Expr Expr;
 struct Expr {
@@ -203,7 +206,8 @@ struct Expr {
   union {
     struct { Expr *lhs, *rhs; }; /* valid for ExprKind_BINARY */
     Expr *expr; /* valid for ExprKind_UNARY, ExprKind_GROUPING */
-    Val val;
+    Val val; /* valid for ExprKind_BINARY */
+    struct { uint32_t scope, scope_var; }; /* valid for ExprKind_VARIABLE */
   };
 };
 
@@ -218,27 +222,32 @@ typedef struct Stmt Stmt;
 struct Stmt {
   StmtKind kind;
   Lex op;
-  uint64_t ident; /* for StmtKind_DECL */
   union {
     Expr *expr; /* valid for StmtKind_EXPR, StmtKind_PRINT, StmtKind_DECL */
     Stmt *last_stmt; /* valid for StmtKind_BLOCK */
   };
+  uint32_t scope; /* intended for StmtKind_DECL, StmtKind_BLOCK */
+  union {
+    uint32_t scope_var; /* valid for StmtKind_DECL */
+    uint32_t var_count; /* valid for StmtKind_BLOCK */
+  };
 };
 
 typedef struct {
+  uint32_t scopes, scope_vars;
   Lex *in;
-  Expr *expr_out; /* last expression output; to initialize, malloc and subtract 1 */
-  Stmt *stmt_out;
+  Expr *expr_start, *expr_out; /* last expression output; to initialize, malloc and subtract 1 */
+  Stmt *stmt_start, *stmt_out;
   char *src;
 } ParseState;
 
 static Expr *ps_push_expr(ParseState *ps, Expr expr) {
-  *++ps->expr_out = expr;
-  return ps->expr_out;
+  *ps->expr_out = expr;
+  return ps->expr_out++;
 }
 static Stmt *ps_push_stmt(ParseState *ps, Stmt stmt) {
-  *++ps->stmt_out = stmt;
-  return ps->stmt_out;
+  *ps->stmt_out = stmt;
+  return ps->stmt_out++;
 }
 
 static Expr *parse_expr(ParseState *ps);
@@ -251,6 +260,19 @@ static Expr *parse_primary(ParseState *ps) {
     case LexKind_FALSE:  val = (Val) { ValKind_BOOL, .bool = 0           }; break;
     case LexKind_NUMBER: val = (Val) { ValKind_NUM,  .num  = ps->in->num }; break;
     case LexKind_STRING: val = (Val) { ValKind_STR,  .str  = ps->in->str }; break;
+    case LexKind_IDENTIFIER: {
+      for (Stmt *stmt = ps->stmt_out; stmt != ps->stmt_start; stmt--)
+        if (stmt->kind != StmtKind_DECL  &&
+            stmt->scope == ps->scopes    &&
+            stmt->op.hash == ps->in->hash) 
+          return ps_push_expr(ps, (Expr) {
+            ExprKind_VARIABLE,
+            *ps->in++,
+            .scope = ps->scopes,
+            .scope_var = stmt->scope_var
+          });
+      bailf("Couldn't find declaration for identifier %d", ps->in->hash);
+    } break;
     case LexKind_LEFT_PAREN: {
       ps->in++;
       Expr *expr = parse_expr(ps);
@@ -316,22 +338,36 @@ static Stmt *parse_stmt(ParseState *ps) {
   Stmt *stmt = NULL;
   switch (ps->in->kind) {
     case LexKind_VAR: {
-      assert(ps->in[1].kind == LexKind_IDENTIFIER &&
+      Lex ident = ps->in[1];
+      assert(    ident.kind == LexKind_IDENTIFIER &&
              ps->in[2].kind == LexKind_EQUAL      );
       ps->in += 3;
       stmt = ps_push_stmt(ps, (Stmt) {
         .kind = StmtKind_DECL,
-        .ident = ps->in[1].hash,
-        .expr = parse_expr(ps)
+        .op = ident,
+        .expr = parse_expr(ps),
+        .scope = ps->scopes,
+        .scope_var = ps->scope_vars++,
       });
     } break;
     case LexKind_LEFT_BRACE: {
+      uint32_t temp = ps->scope_vars;
+      ps->scope_vars = 0;
+      ps->scopes++;
       Stmt *last = NULL;
       Lex lbl = *ps->in++;
       while (ps->in->kind != LexKind_RIGHT_BRACE)
         last = parse_stmt(ps);
       ps->in++;
-      stmt = ps_push_stmt(ps, (Stmt) { StmtKind_BLOCK, lbl, .last_stmt = last });
+      stmt = ps_push_stmt(ps, (Stmt) {
+        StmtKind_BLOCK,
+        lbl,
+        .last_stmt = last,
+        .scope = ps->scopes,
+        .var_count = ps->scope_vars,
+      });
+      ps->scopes--;
+      ps->scope_vars = temp;
     } break;
     case LexKind_PRINT: {
       Lex pl = *ps->in++;
@@ -371,6 +407,7 @@ static void print_expr(char *src, Expr *expr) {
       putchar(')');
     } break;
     case ExprKind_LITERAL: val_print(expr->val); break;
+    case ExprKind_VARIABLE: printf("%ld", expr->op.hash); break;
     case ExprKind_GROUPING: putchar('('); print_expr(src, expr->expr); putchar(')'); break;
   }
 }
@@ -378,20 +415,20 @@ static void print_expr(char *src, Expr *expr) {
 static void print_stmts(char *src, Stmt *stmt, Stmt *end) {
   for (; stmt->kind && stmt != end; stmt++)
     switch (stmt->kind) {
-      case StmtKind_NULL: bail("Unexpected null statement!");                             break;
-      case StmtKind_DECL: printf("var %ld = ", stmt->ident); print_expr(src, stmt->expr); break;
-      case StmtKind_EXPR: print_expr(src, stmt->expr);                                    break;
-      case StmtKind_PRINT: printf("print "); print_expr(src, stmt->expr);                 break;
+      case StmtKind_NULL: bail("Unexpected null statement!");                               break;
+      case StmtKind_DECL: printf("var %ld = ", stmt->op.hash); print_expr(src, stmt->expr); break;
+      case StmtKind_EXPR: print_expr(src, stmt->expr);                                      break;
+      case StmtKind_PRINT: printf("print "); print_expr(src, stmt->expr);                   break;
       case StmtKind_BLOCK: {
         printf("{\n");
         print_stmts(src, stmt+1, stmt->last_stmt);
         printf("}\n");
       } break;
     }
-  putchar(';');
+  printf(";\n");
 }
 
-typedef struct { Expr *expr; Stmt *stmt; } ParseRes;
+typedef struct { Expr *expr; Stmt *stmt; uint32_t global_var_count; } ParseRes;
 static ParseRes parse(char *str) {
   Lex *lex_in = lex(str), *lex_end = lex_in;
 
@@ -399,27 +436,42 @@ static ParseRes parse(char *str) {
   for (; lex_end->kind; lex_end++)
     stmt_n += lex_end->kind == LexKind_SEMICOLON;
 
-  Expr *expr = calloc(lex_end - lex_in, sizeof(Expr));
-  Stmt *stmt = calloc(          stmt_n, sizeof(Stmt));
+  if (stmt_n == 0) bail("Expected at least one statement");
+
   ParseState ps = {
     .src = str,
     .in = lex_in,
-    .expr_out = expr - 1,
-    .stmt_out = stmt - 1
+    .expr_start = calloc(lex_end - lex_in, sizeof(Expr)),
+    .stmt_start = calloc(          stmt_n, sizeof(Stmt)),
   };
+  ps.expr_out = ps.expr_start;
+  ps.stmt_out = ps.stmt_start;
   parse_program(&ps);
 
-  print_stmts(str, stmt, NULL);
-  putchar('\n');
+  print_stmts(str, ps.stmt_start, NULL);
   free(lex_in);
-  return (ParseRes) { .expr = expr, .stmt = stmt };
+  return (ParseRes) {
+    .expr = ps.expr_start,
+    .stmt = ps.stmt_start
+    .global_var_count = ps.scope_vars,
+  };
 }
 
-static Val eval_expr(Expr *expr);
+typedef struct {
+  uint32_t *scope_stack; /* stores where each scope's variables start */
+  Val *stack; /* pointer to next available Val in stack_mem */
+  Val *stack_mem;
+} EvalState;
 
-static Val eval_binary(Expr *expr) {
-  Val lhs = eval_expr(expr->lhs),
-      rhs = eval_expr(expr->rhs);
+static Val *es_var(EvalState *es, uint32_t scope, uint32_t scope_var) {
+  return es->stack_mem + es->scope_stack[scope] + scope_var;
+}
+
+static Val eval_expr(EvalState *es, Expr *expr);
+
+static Val eval_binary(EvalState *es, Expr *expr) {
+  Val lhs = eval_expr(es, expr->lhs),
+      rhs = eval_expr(es, expr->rhs);
   if (lhs.kind == ValKind_NUM && rhs.kind == ValKind_NUM)
     switch (expr->op.kind) {
       case LexKind_MINUS:         return (Val) { ValKind_NUM,  .num  = lhs.num - rhs.num  };
@@ -458,8 +510,8 @@ static Val eval_binary(Expr *expr) {
   return (Val) {0};
 }
 
-static Val eval_unary(Expr *expr) {
-  Val inr = eval_expr(expr->expr);
+static Val eval_unary(EvalState *es, Expr *expr) {
+  Val inr = eval_expr(es, expr->expr);
   switch (expr->op.kind) {
     case (LexKind_MINUS): {
       if (inr.kind == ValKind_NUM)
@@ -478,31 +530,49 @@ static Val eval_unary(Expr *expr) {
   return (Val) {0};
 }
 
-static Val eval_expr(Expr *expr) {
+static Val eval_expr(EvalState *es, Expr *expr) {
   switch (expr->kind) {
-    case ExprKind_NULL:     bail("Unexpected NULL expr?");        break;
-    case ExprKind_BINARY:   return eval_binary(expr);             break;
-    case ExprKind_UNARY:    return eval_unary(expr);              break;
-    case ExprKind_LITERAL:  return expr->val;                     break;
-    case ExprKind_GROUPING: return eval_expr(expr->expr);         break;
+    case ExprKind_NULL:     bail("Unexpected NULL expr?");                    break;
+    case ExprKind_BINARY:   return eval_binary(es, expr);                     break;
+    case ExprKind_UNARY:    return eval_unary(es, expr);                      break;
+    case ExprKind_LITERAL:  return expr->val;                                 break;
+    case ExprKind_VARIABLE: return *es_var(es, expr->scope, expr->scope_var); break;
+    case ExprKind_GROUPING: return eval_expr(es, expr->expr);                 break;
   }
   return (Val) {0};
 }
 
-static void eval_stmt(Stmt *stmt) {
+static void eval_stmt(EvalState *es, Stmt *stmt) {
   switch (stmt->kind) {
-    case StmtKind_PRINT: val_print(eval_expr(stmt->expr)); putchar('\n'); break;
+    case StmtKind_PRINT: val_print(eval_expr(es, stmt->expr)); putchar('\n'); break;
+    case StmtKind_DECL: {
+      *es_var(es, stmt->scope, stmt->scope_var) = eval_expr(es, stmt->expr);
+    } break;
+    case StmtKind_BLOCK: {
+      for (Stmt *loop_st = stmt; loop_st++ != stmt->last_stmt; )
+        eval_stmt(es, loop_st);
+    } break;
     default: bail("Unhandled StmtKind"); break;
   }
 }
 
 static void eval(char *str) {
   ParseRes pr = parse(str);
+  EvalState es = {
+    .stack_mem = calloc(1 << 10, sizeof(Val)),
+    .scope_stack = calloc(1 << 5, sizeof(uint32_t))
+  };
+  es.stack = es.stack_mem + pr.global_var_count;
+
   Stmt *wtr = pr.stmt;
   for (; wtr->kind; wtr++)
-    eval_stmt(wtr);
+    eval_stmt(&es, wtr);
+
   free(pr.expr);
   free(pr.stmt);
+
+  free(es.stack_mem);
+  free(es.scope_stack);
 }
 
 static void repl() {
